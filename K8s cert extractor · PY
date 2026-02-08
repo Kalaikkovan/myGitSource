@@ -1,0 +1,412 @@
+"""
+Kubernetes Certificate Extractor and Confluence Publisher
+
+This script:
+1. Fetches all secrets from Kubernetes (all namespaces or specific ones)
+2. Identifies secrets containing certificates (TLS, Opaque with cert data)
+3. Extracts certificate details: CN, SAN, Serial, Issuer, Expiry
+4. Publishes a formatted report to Confluence
+
+Requirements:
+    pip install kubernetes cryptography atlassian-python-api python-dateutil
+"""
+
+import base64
+import logging
+from datetime import datetime, timezone
+from typing import List, Dict, Optional
+import sys
+
+from kubernetes import client, config
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from atlassian import Confluence
+from dateutil import parser as date_parser
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class CertificateInfo:
+    """Data class to hold certificate information"""
+    def __init__(self, cert_data: dict):
+        self.secret_name = cert_data['secret_name']
+        self.namespace = cert_data['namespace']
+        self.secret_type = cert_data['secret_type']
+        self.key_name = cert_data['key_name']
+        self.common_name = cert_data['common_name']
+        self.san = cert_data['san']
+        self.serial_number = cert_data['serial_number']
+        self.issuer = cert_data['issuer']
+        self.not_before = cert_data['not_before']
+        self.not_after = cert_data['not_after']
+        self.days_until_expiry = cert_data['days_until_expiry']
+        self.is_expired = cert_data['is_expired']
+        self.signature_algorithm = cert_data['signature_algorithm']
+
+
+class KubernetesCertExtractor:
+    """Extract certificates from Kubernetes secrets"""
+    
+    def __init__(self, namespaces: Optional[List[str]] = None):
+        """
+        Initialize Kubernetes client
+        
+        Args:
+            namespaces: List of namespaces to scan. If None, scans all namespaces.
+        """
+        try:
+            # Try in-cluster config first, fallback to kubeconfig
+            try:
+                config.load_incluster_config()
+                logger.info("Using in-cluster Kubernetes configuration")
+            except config.ConfigException:
+                config.load_kube_config()
+                logger.info("Using kubeconfig file")
+            
+            self.v1 = client.CoreV1Api()
+            self.namespaces = namespaces
+        except Exception as e:
+            logger.error(f"Failed to initialize Kubernetes client: {e}")
+            raise
+    
+    def get_all_secrets(self) -> List[client.V1Secret]:
+        """Fetch all secrets from specified namespaces"""
+        secrets = []
+        
+        try:
+            if self.namespaces:
+                # Scan specific namespaces
+                for namespace in self.namespaces:
+                    logger.info(f"Fetching secrets from namespace: {namespace}")
+                    ns_secrets = self.v1.list_namespaced_secret(namespace)
+                    secrets.extend(ns_secrets.items)
+            else:
+                # Scan all namespaces
+                logger.info("Fetching secrets from all namespaces")
+                all_secrets = self.v1.list_secret_for_all_namespaces()
+                secrets.extend(all_secrets.items)
+            
+            logger.info(f"Found {len(secrets)} total secrets")
+            return secrets
+        except Exception as e:
+            logger.error(f"Error fetching secrets: {e}")
+            raise
+    
+    def extract_certificate_info(self, cert_bytes: bytes, secret_name: str, 
+                                 namespace: str, secret_type: str, 
+                                 key_name: str) -> Optional[Dict]:
+        """Extract information from a certificate"""
+        try:
+            cert = x509.load_pem_x509_certificate(cert_bytes, default_backend())
+            
+            # Extract Common Name
+            cn_list = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+            common_name = cn_list[0].value if cn_list else "N/A"
+            
+            # Extract Subject Alternative Names (SAN)
+            san = []
+            try:
+                san_ext = cert.extensions.get_extension_for_oid(
+                    x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+                )
+                san = [str(name) for name in san_ext.value]
+            except x509.ExtensionNotFound:
+                san = []
+            
+            # Extract Issuer
+            issuer_cn_list = cert.issuer.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+            issuer = issuer_cn_list[0].value if issuer_cn_list else "N/A"
+            
+            # Calculate days until expiry
+            now = datetime.now(timezone.utc)
+            not_after = cert.not_valid_after_utc
+            days_until_expiry = (not_after - now).days
+            is_expired = days_until_expiry < 0
+            
+            return {
+                'secret_name': secret_name,
+                'namespace': namespace,
+                'secret_type': secret_type,
+                'key_name': key_name,
+                'common_name': common_name,
+                'san': ', '.join(san) if san else 'N/A',
+                'serial_number': hex(cert.serial_number),
+                'issuer': issuer,
+                'not_before': cert.not_valid_before_utc.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                'not_after': cert.not_valid_after_utc.strftime('%Y-%m-%d %H:%M:%S UTC'),
+                'days_until_expiry': days_until_expiry,
+                'is_expired': is_expired,
+                'signature_algorithm': cert.signature_algorithm_oid._name
+            }
+        except Exception as e:
+            logger.warning(f"Failed to parse certificate from {namespace}/{secret_name}/{key_name}: {e}")
+            return None
+    
+    def scan_secrets_for_certificates(self) -> List[Dict]:
+        """Scan all secrets and extract certificate information"""
+        certificates = []
+        secrets = self.get_all_secrets()
+        
+        # Common keys that might contain certificates
+        cert_keys = ['tls.crt', 'ca.crt', 'cert', 'certificate', 'tls-cert', 'server.crt', 'client.crt']
+        
+        for secret in secrets:
+            if not secret.data:
+                continue
+            
+            secret_name = secret.metadata.name
+            namespace = secret.metadata.namespace
+            secret_type = secret.type
+            
+            # Check each key in the secret
+            for key, value in secret.data.items():
+                # Check if this key likely contains a certificate
+                if key in cert_keys or key.endswith('.crt') or key.endswith('.pem'):
+                    try:
+                        cert_bytes = base64.b64decode(value)
+                        
+                        # Try to parse as certificate
+                        cert_info = self.extract_certificate_info(
+                            cert_bytes, secret_name, namespace, secret_type, key
+                        )
+                        
+                        if cert_info:
+                            certificates.append(cert_info)
+                            logger.info(f"Extracted certificate: {namespace}/{secret_name}/{key}")
+                    except Exception as e:
+                        logger.debug(f"Skipping {namespace}/{secret_name}/{key}: {e}")
+                        continue
+        
+        logger.info(f"Extracted {len(certificates)} certificates")
+        return certificates
+
+
+class ConfluencePublisher:
+    """Publish certificate report to Confluence"""
+    
+    def __init__(self, url: str, username: str, api_token: str, space_key: str):
+        """
+        Initialize Confluence client
+        
+        Args:
+            url: Confluence base URL (e.g., https://yourcompany.atlassian.net)
+            username: Confluence username/email
+            api_token: Confluence API token
+            space_key: Space key where page will be created
+        """
+        try:
+            self.confluence = Confluence(
+                url=url,
+                username=username,
+                password=api_token,
+                cloud=True  # Set to False for Confluence Server/Data Center
+            )
+            self.space_key = space_key
+            logger.info(f"Connected to Confluence: {url}")
+        except Exception as e:
+            logger.error(f"Failed to connect to Confluence: {e}")
+            raise
+    
+    def generate_html_table(self, certificates: List[Dict]) -> str:
+        """Generate HTML table from certificate data"""
+        
+        # Sort by expiry date (soonest first)
+        sorted_certs = sorted(certificates, key=lambda x: x['days_until_expiry'])
+        
+        html = """
+        <h2>Kubernetes Certificate Inventory</h2>
+        <p><strong>Total Certificates:</strong> {total}</p>
+        <p><strong>Expired:</strong> <span style="color: red;">{expired}</span></p>
+        <p><strong>Expiring in 30 days:</strong> <span style="color: orange;">{expiring_soon}</span></p>
+        <p><strong>Last Updated:</strong> {timestamp}</p>
+        
+        <table>
+            <thead>
+                <tr style="background-color: #f0f0f0;">
+                    <th>Namespace</th>
+                    <th>Secret Name</th>
+                    <th>Key</th>
+                    <th>Common Name (CN)</th>
+                    <th>Subject Alternative Names</th>
+                    <th>Serial Number</th>
+                    <th>Issuer</th>
+                    <th>Not Before</th>
+                    <th>Not After</th>
+                    <th>Days Until Expiry</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        
+        expired_count = sum(1 for c in certificates if c['is_expired'])
+        expiring_soon = sum(1 for c in certificates if 0 <= c['days_until_expiry'] <= 30)
+        
+        for cert in sorted_certs:
+            # Color code based on expiry
+            if cert['is_expired']:
+                status = '<span style="color: red; font-weight: bold;">EXPIRED</span>'
+                row_style = 'background-color: #ffebee;'
+            elif cert['days_until_expiry'] <= 30:
+                status = '<span style="color: orange; font-weight: bold;">EXPIRING SOON</span>'
+                row_style = 'background-color: #fff3e0;'
+            elif cert['days_until_expiry'] <= 90:
+                status = '<span style="color: #ff9800;">Warning</span>'
+                row_style = ''
+            else:
+                status = '<span style="color: green;">Valid</span>'
+                row_style = ''
+            
+            html += f"""
+                <tr style="{row_style}">
+                    <td>{cert['namespace']}</td>
+                    <td><code>{cert['secret_name']}</code></td>
+                    <td><code>{cert['key_name']}</code></td>
+                    <td>{cert['common_name']}</td>
+                    <td>{cert['san']}</td>
+                    <td><code>{cert['serial_number']}</code></td>
+                    <td>{cert['issuer']}</td>
+                    <td>{cert['not_before']}</td>
+                    <td>{cert['not_after']}</td>
+                    <td style="text-align: center;">{cert['days_until_expiry']}</td>
+                    <td>{status}</td>
+                </tr>
+            """
+        
+        html += """
+            </tbody>
+        </table>
+        
+        <h3>Certificates by Status</h3>
+        <ac:structured-macro ac:name="info">
+            <ac:rich-text-body>
+                <p>Set up alerts for certificates expiring in less than 30 days to prevent service disruptions.</p>
+            </ac:rich-text-body>
+        </ac:structured-macro>
+        """
+        
+        return html.format(
+            total=len(certificates),
+            expired=expired_count,
+            expiring_soon=expiring_soon,
+            timestamp=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        )
+    
+    def publish_or_update_page(self, title: str, certificates: List[Dict], 
+                               parent_page_id: Optional[str] = None) -> str:
+        """
+        Create or update Confluence page with certificate report
+        
+        Args:
+            title: Page title
+            certificates: List of certificate data
+            parent_page_id: Optional parent page ID
+        
+        Returns:
+            Page URL
+        """
+        html_content = self.generate_html_table(certificates)
+        
+        try:
+            # Check if page already exists
+            existing_page = self.confluence.get_page_by_title(
+                space=self.space_key,
+                title=title
+            )
+            
+            if existing_page:
+                # Update existing page
+                logger.info(f"Updating existing page: {title}")
+                page_id = existing_page['id']
+                self.confluence.update_page(
+                    page_id=page_id,
+                    title=title,
+                    body=html_content
+                )
+            else:
+                # Create new page
+                logger.info(f"Creating new page: {title}")
+                result = self.confluence.create_page(
+                    space=self.space_key,
+                    title=title,
+                    body=html_content,
+                    parent_id=parent_page_id
+                )
+                page_id = result['id']
+            
+            # Get page URL
+            page_info = self.confluence.get_page_by_id(page_id, expand='_links')
+            page_url = f"{self.confluence.url}{page_info['_links']['webui']}"
+            
+            logger.info(f"Successfully published to Confluence: {page_url}")
+            return page_url
+        
+        except Exception as e:
+            logger.error(f"Failed to publish to Confluence: {e}")
+            raise
+
+
+def main():
+    """Main execution function"""
+    
+    # ============================================================================
+    # CONFIGURATION - Update these values
+    # ============================================================================
+    
+    # Kubernetes Configuration
+    NAMESPACES = None  # None = all namespaces, or ['default', 'kube-system', 'prod']
+    
+    # Confluence Configuration
+    CONFLUENCE_URL = "https://yourcompany.atlassian.net"  # Your Confluence URL
+    CONFLUENCE_USERNAME = "your-email@company.com"         # Your email
+    CONFLUENCE_API_TOKEN = "your-api-token-here"           # Generate at: https://id.atlassian.com/manage-profile/security/api-tokens
+    CONFLUENCE_SPACE_KEY = "SRE"                           # Your space key
+    CONFLUENCE_PAGE_TITLE = "Kubernetes Certificate Inventory"
+    CONFLUENCE_PARENT_PAGE_ID = None                       # Optional: parent page ID
+    
+    # ============================================================================
+    
+    try:
+        # Step 1: Extract certificates from Kubernetes
+        logger.info("Starting certificate extraction from Kubernetes...")
+        extractor = KubernetesCertExtractor(namespaces=NAMESPACES)
+        certificates = extractor.scan_secrets_for_certificates()
+        
+        if not certificates:
+            logger.warning("No certificates found!")
+            return
+        
+        # Step 2: Publish to Confluence
+        logger.info("Publishing report to Confluence...")
+        publisher = ConfluencePublisher(
+            url=CONFLUENCE_URL,
+            username=CONFLUENCE_USERNAME,
+            api_token=CONFLUENCE_API_TOKEN,
+            space_key=CONFLUENCE_SPACE_KEY
+        )
+        
+        page_url = publisher.publish_or_update_page(
+            title=CONFLUENCE_PAGE_TITLE,
+            certificates=certificates,
+            parent_page_id=CONFLUENCE_PARENT_PAGE_ID
+        )
+        
+        logger.info("=" * 80)
+        logger.info(f"SUCCESS! Certificate report published to: {page_url}")
+        logger.info(f"Total certificates: {len(certificates)}")
+        logger.info(f"Expired: {sum(1 for c in certificates if c['is_expired'])}")
+        logger.info(f"Expiring in 30 days: {sum(1 for c in certificates if 0 <= c['days_until_expiry'] <= 30)}")
+        logger.info("=" * 80)
+        
+    except Exception as e:
+        logger.error(f"Script failed: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
